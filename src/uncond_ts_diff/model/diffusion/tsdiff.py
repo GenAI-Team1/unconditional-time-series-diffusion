@@ -153,6 +153,27 @@ class TSDiff(TSDiffBase):
 
         return samples[..., 0]
 
+    def sample_n_grad(
+        self,
+        num_samples: int = 1,
+        return_lags: bool = False,
+    ):
+        device = next(self.backbone.parameters()).device
+        seq_len = self.context_length + self.prediction_length
+
+        samples = torch.randn(
+            (num_samples, seq_len, self.input_dim), device=device
+        )
+
+        for i in reversed(range(0, self.timesteps)):
+            t = torch.full((num_samples,), i, device=device, dtype=torch.long)
+            samples = self.p_sample(samples, t, i, features=None)
+
+        if return_lags:
+            return samples
+
+        return samples[..., 0]
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         for rate, state_dict in zip(self.ema_rate, self.ema_state_dicts):
             update_ema(state_dict, self.backbone.state_dict(), rate=rate)

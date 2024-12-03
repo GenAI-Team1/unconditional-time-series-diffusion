@@ -165,6 +165,9 @@ class TSDiffBase(pl.LightningModule):
 
     @torch.no_grad()
     def p_sample(self, x, t, t_index, features=None):
+        return self.p_sample_grad(x, t, t_index, features)
+    
+    def p_sample_grad(self, x, t, t_index, features=None):
         betas_t = extract(self.betas, t, x.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(
             self.sqrt_one_minus_alphas_cumprod, t, x.shape
@@ -185,6 +188,9 @@ class TSDiffBase(pl.LightningModule):
 
     @torch.no_grad()
     def p_sample_ddim(self, x, t, features=None, noise=None):
+        return self.p_sample_ddim_grad(x, t, features, noise)
+    
+    def p_sample_ddim_grad(self, x, t, features=None, noise=None):
         if noise is None:
             noise = self.backbone(x, t, features)
         sqrt_alphas_cumprod_prev_t = extract(
