@@ -40,16 +40,8 @@ class NoOPGuidance(DDPMGuidance):
 
         seq = torch.randn_like(observation)
         seq[observation_mask == 1] = observation[observation_mask == 1]
-        t = torch.full((batch_size,), 0, device=device, dtype=torch.long)
-        seq = self.model.p_sample(seq, t, 0, features)
-        scale = self.scale_func(seq, t, base_scale=base_scale)
-        seq = seq + scale * self.score_func(
-            seq,
-            t,
-            observation=observation,
-            observation_mask=observation_mask,
-            features=features,
-        )
+        t = torch.full((batch_size,), self.model.timesteps - 1, device=device, dtype=torch.long)
+        seq = self.model.p_sample_ddim(seq, t, 0)
 
         return seq
 
@@ -195,7 +187,7 @@ def main(config: dict, log_dir: str):
             **sampler_params,
         )
 
-    optimizer_one_step = torch.optim.Adam(sampler.parameters(), lr=lr)
+    optimizer_one_step = torch.optim.Adam(one_step_model.parameters(), lr=lr)
     with trange(num_steps) as pbar:
         for step in pbar:
             with torch.no_grad():
@@ -219,7 +211,7 @@ def main(config: dict, log_dir: str):
 
                 # making prediction data
                 masked_data[observation_mask == 0] = torch.randn_like(masked_data[observation_mask == 0])
-                samples = sampler.guide(masked_data, observation_mask, None, 1.0)
+                samples = sampler.guide(masked_data, observation_mask, None, sampler.scale)
 
             masked_datas = masked_data.view(-1, batch_size, masked_data.shape[1], masked_data.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
             sampless = samples.view(-1, batch_size, samples.shape[1], samples.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
@@ -228,7 +220,7 @@ def main(config: dict, log_dir: str):
             for masked_data, samples, observation_mask in zip(masked_datas, sampless, observation_masks):
                 optimizer_one_step.zero_grad()
                 # calculating regression loss
-                t = torch.full((batch_size,), 0, device=device, dtype=torch.long)
+                t = torch.full((batch_size,), one_step_model.timesteps - 1, device=device, dtype=torch.long)
                 one_step_samples = one_step_model.p_sample_ddim_grad(masked_data, t, features=None)
 
                 loss = torch.nn.functional.mse_loss(one_step_samples[observation_mask == 0], samples[observation_mask == 0])
