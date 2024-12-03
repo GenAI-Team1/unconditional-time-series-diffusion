@@ -8,6 +8,7 @@ import yaml
 import torch
 from tqdm.auto import tqdm
 from gluonts.dataset.field_names import FieldName
+from gluonts.torch.util import lagged_sequence_values
 from gluonts.evaluation import make_evaluation_predictions, Evaluator
 from tqdm import tqdm, trange
 
@@ -65,75 +66,44 @@ def load_model(config):
     model = model.to(config["device"])
     return model
 
-def evaluate_guidance(
+def evaluate_one_step_generator(
     config, model, test_dataset, transformation, num_samples=100
 ):
-    logger.info(f"Evaluating with {num_samples} samples.")
-    results = []
-    if config["setup"] == "forecasting":
-        missing_data_kwargs_list = [
-            {
-                "missing_scenario": "none",
-                "missing_values": 0,
-            }
-        ]
-        config["missing_data_configs"] = missing_data_kwargs_list
-    elif config["setup"] == "missing_values":
-        missing_data_kwargs_list = config["missing_data_configs"]
-    else:
-        raise ValueError(f"Unknown setup {config['setup']}")
+    transformed_testdata = transformation.apply(
+        test_dataset, is_train=False
+    )
+    test_splitter = create_splitter(
+        past_length=config["context_length"] + max(model.lags_seq),
+        future_length=config["prediction_length"],
+        mode="test",
+    )
 
-    Guidance = guidance_map[config["sampler"]]
-    sampler_params = config["sampler_params"]
-    for missing_data_kwargs in missing_data_kwargs_list:
-        logger.info(
-            f"Evaluating scenario '{missing_data_kwargs['missing_scenario']}' "
-            f"with {missing_data_kwargs['missing_values']:.1f} missing_values."
-        )
+    masking_transform = MaskInput(
+        FieldName.TARGET,
+        FieldName.OBSERVED_VALUES,
+        config["context_length"],
+        None,
+        0,
+    )
+    test_transform = test_splitter + masking_transform
 
-        sampler = Guidance(
-            model=model,
-            prediction_length=config["prediction_length"],
-            num_samples=num_samples,
-            **missing_data_kwargs,
-            **sampler_params,
-        )
+    predictor = sampler.get_predictor(
+        test_transform,
+        batch_size=1280 // num_samples,
+        device=config["device"],
+    )
+    forecast_it, ts_it = make_evaluation_predictions(
+        dataset=transformed_testdata,
+        predictor=predictor,
+        num_samples=num_samples,
+    )
+    forecasts = list(tqdm(forecast_it, total=len(transformed_testdata)))
+    tss = list(ts_it)
+    evaluator = Evaluator()
+    metrics, _ = evaluator(tss, forecasts)
+    metrics = filter_metrics(metrics)
+    results.append(dict(**missing_data_kwargs, **metrics))
 
-        transformed_testdata = transformation.apply(
-            test_dataset, is_train=False
-        )
-        test_splitter = create_splitter(
-            past_length=config["context_length"] + max(model.lags_seq),
-            future_length=config["prediction_length"],
-            mode="test",
-        )
-
-        masking_transform = MaskInput(
-            FieldName.TARGET,
-            FieldName.OBSERVED_VALUES,
-            config["context_length"],
-            missing_data_kwargs["missing_scenario"],
-            missing_data_kwargs["missing_values"],
-        )
-        test_transform = test_splitter + masking_transform
-
-        predictor = sampler.get_predictor(
-            test_transform,
-            batch_size=1280 // num_samples,
-            device=config["device"],
-        )
-        forecast_it, ts_it = make_evaluation_predictions(
-            dataset=transformed_testdata,
-            predictor=predictor,
-            num_samples=num_samples,
-        )
-        forecasts = list(tqdm(forecast_it, total=len(transformed_testdata)))
-        tss = list(ts_it)
-        evaluator = Evaluator()
-        metrics, _ = evaluator(tss, forecasts)
-        metrics = filter_metrics(metrics)
-        results.append(dict(**missing_data_kwargs, **metrics))
-        
     return results
 
 def main(config: dict, log_dir: str):
@@ -178,21 +148,33 @@ def main(config: dict, log_dir: str):
             with torch.no_grad():
                 # generating data
                 gt_data = real_model.sample_n(batch_size, return_lags=True)
-                masked_data = gt_data.clone()
-                masked_data[:, :, -masking_size:] = torch.randn_like(masked_data[:, :, -masking_size:])
+                masked_data = gt_data.clone() # (batch_size, seq_len, time_lags)
+                
+                # making observation mask
+                prior_mask = torch.ones((batch_size, max(real_model.model.lags_seq)), device=device) # (batch_size, time_lags - 1)
+                observation_mask = torch.ones_like(samples[:, :]) # (batch_size, seq_len)
+                observation_mask[:,  -masking_size:] = 0.0
+                lagged_mask = lagged_sequence_values(
+                    real_model.model.lags_seq,
+                    prior_mask,
+                    observation_mask,
+                    dim=1,
+                ) # (batch_size, seq_len, time_lags - 1)
+                observation_mask = torch.cat([observation_mask[:, :, None], lagged_mask], dim=-1) # (batch_size, seq_len, time_lags)
 
                 # making prediction data
-                samples = masked_data
-                observation_mask = torch.ones_like(samples)
-                observation_mask[:, :, -masking_size:] = 0.0
+                masked_data[observation_mask != 1] = torch.randn_like(masked_data[observation_mask != 1])
                 samples = sampler.guide(samples, observation_mask, None, 1.0)
                 
             # calculating regression loss
             t = torch.full((batch_size,), 0, device=device, dtype=torch.long)
             one_step_samples = one_step_model.p_sample(masked_data, t, 0, features=None)
+
             loss = torch.nn.functional.mse_loss(one_step_samples, samples)
+            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(one_step_model.parameters(), gradient_clip_val)
+
             optimizer_one_step.step()
             pbar.set_postfix({"loss": loss.item()})
 
@@ -211,7 +193,7 @@ def main(config: dict, log_dir: str):
         )
 
         # Run guidance
-        results = evaluate_guidance(
+        results = evaluate_one_step_generator(
             config, one_step_model, dataset.test, transformation, num_samples=num_samples
         )
 
