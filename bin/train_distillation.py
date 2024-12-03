@@ -41,7 +41,7 @@ class NoOPGuidance(DDPMGuidance):
         seq = torch.randn_like(observation)
         seq[observation_mask == 1] = observation[observation_mask == 1]
         t = torch.full((batch_size,), self.model.timesteps - 1, device=device, dtype=torch.long)
-        seq = self.model.p_sample_ddim(seq, t, 0)
+        seq = self.model.p_sample_ddim(seq, t, features=None)
 
         return seq
 
@@ -153,7 +153,7 @@ def evaluate_one_step_generator(
 
 def main(config: dict, log_dir: str):
     # set hyperparameter for distillation
-    num_steps = 180 # by micro batch, real batch size is 180 * 64
+    num_steps = 18 # by micro batch, real batch size is 18 * 64
     gradient_clip_val = 0.5
     lr = 1.0e-3
     batch_size = 64
