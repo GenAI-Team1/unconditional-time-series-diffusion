@@ -19,6 +19,7 @@ from uncond_ts_diff.utils import (
     add_config_to_argparser,
     filter_metrics,
     MaskInput,
+    extract
 )
 from uncond_ts_diff.model import TSDiff
 from uncond_ts_diff.dataset import get_gts_dataset
@@ -29,6 +30,21 @@ from uncond_ts_diff.sampler import (
 import uncond_ts_diff.configs as diffusion_configs
 
 guidance_map = {"ddpm": DDPMGuidance, "ddim": DDIMGuidance}
+
+@torch.no_grad()
+def forward_diffusion_with_mask(model: TSDiff, x_start, t, mask, noise=None):
+    device = next(model.backbone.parameters()).device
+    if noise is None:
+        noise = torch.randn_like(x_start, device=device)
+    sqrt_alphas_cumprod_t = extract(
+        model.sqrt_alphas_cumprod, t, x_start.shape
+    )
+    sqrt_one_minus_alphas_cumprod_t = extract(
+        model.sqrt_one_minus_alphas_cumprod, t, x_start.shape
+    )
+    noise_x = sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
+    noise_x[mask == 1] = x_start[mask == 1]
+    return noise_x
 
 class NoOPGuidance(DDPMGuidance):
     @torch.no_grad()
@@ -153,7 +169,7 @@ def evaluate_one_step_generator(
 
 def main(config: dict, log_dir: str):
     # set hyperparameter for distillation
-    num_steps = 18 # by micro batch, real batch size is 18 * 64
+    num_steps = 180 # by micro batch, real batch size is 18 * 64
     gradient_clip_val = 0.5
     lr = 1.0e-3
     batch_size = 64
@@ -164,6 +180,8 @@ def main(config: dict, log_dir: str):
     }
     sampler_params = config["sampler_params"]
     sampling_batch_size = 64 * batch_size
+    is_dmd_loss = True
+    reg_loss_lambda = 1.0
 
     # Read global parameters
     dataset_name = config["dataset"]
@@ -188,6 +206,8 @@ def main(config: dict, log_dir: str):
         )
 
     optimizer_one_step = torch.optim.Adam(one_step_model.parameters(), lr=lr)
+    if is_dmd_loss:
+        optimizer_fake = torch.optim.Adam(fake_model.parameters(), lr=lr)
     with trange(num_steps) as pbar:
         for step in pbar:
             with torch.no_grad():
@@ -219,17 +239,51 @@ def main(config: dict, log_dir: str):
 
             for masked_data, samples, observation_mask in zip(masked_datas, sampless, observation_masks):
                 optimizer_one_step.zero_grad()
+
                 # calculating regression loss
                 t = torch.full((batch_size,), one_step_model.timesteps - 1, device=device, dtype=torch.long)
                 one_step_samples = one_step_model.p_sample_ddim_grad(masked_data, t, features=None)
 
-                loss = torch.nn.functional.mse_loss(one_step_samples[observation_mask == 0], samples[observation_mask == 0])
-                
+                reg_loss = torch.nn.functional.mse_loss(one_step_samples[observation_mask == 0], samples[observation_mask == 0])
+                loss = reg_loss_lambda * reg_loss
+
+                # calculating dmd loss
+                if is_dmd_loss:
+                    dmd_timestep = torch.randint(real_model.timesteps // 50, real_model.timesteps * 49 // 50, (batch_size,), device=device)
+                    dmd_noise = masked_data.detach().clone()
+                    dmd_noise[observation_mask == 0] = torch.randn_like(dmd_noise[observation_mask == 0])
+                    dmd_x = one_step_model.p_sample_ddim_grad(dmd_noise, t, features=None)
+                    with torch.no_grad():
+                        noisy_x = forward_diffusion_with_mask(real_model, dmd_x, dmd_timestep, observation_mask)
+                        pred_real = real_model.p_sample_ddim_grad(noisy_x, dmd_timestep, features=None)
+                        pred_fake = fake_model.p_sample_ddim_grad(noisy_x, dmd_timestep, features=None)
+                        weighting_factor = (dmd_x[observation_mask == 0] - pred_real[observation_mask == 0]).view(batch_size, -1).abs().mean(dim=1) + 1e-9
+                        weighting_factor = weighting_factor.view(-1, 1, 1).expand_as(dmd_x)
+                        grad = (pred_fake - pred_real) / weighting_factor
+                        target = dmd_x - grad
+
+                    dmd_loss = 0.5 * torch.nn.functional.mse_loss(dmd_x[observation_mask == 0], target[observation_mask == 0])
+                    loss += dmd_loss
+
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(one_step_model.parameters(), gradient_clip_val)
-
                 optimizer_one_step.step()
+
+                # calculating denoising loss for fake model
+                if is_dmd_loss:
+                    dmd_timestep = torch.randint(0, fake_model.timesteps, (batch_size,), device=device)
+                    dmd_x = dmd_x.detach()
+                    with torch.no_grad():
+                        noisy_x = forward_diffusion_with_mask(fake_model, dmd_x, dmd_timestep, observation_mask)
+                    pred_fake = fake_model.p_sample_ddim_grad(noisy_x, dmd_timestep, features=None)
+                    denoising_loss = torch.nn.functional.mse_loss(pred_fake[observation_mask == 0], dmd_x[observation_mask == 0])
+                    optimizer_fake.zero_grad()
+                    denoising_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(fake_model.parameters(), gradient_clip_val)
+                    optimizer_fake.step()
+
             pbar.set_postfix({"loss": loss.item()})
+            tqdm.write(f"Step {step}: loss {loss.item()}")
 
     if True: # for evaluation code
         dataset = get_gts_dataset(dataset_name)
@@ -249,7 +303,7 @@ def main(config: dict, log_dir: str):
         results = evaluate_one_step_generator(
             config, one_step_model, dataset.test, transformation, num_samples=100
         )
-
+        print(results)
         # Save results
         log_dir = Path(log_dir) / "guidance_logs"
         log_dir.mkdir(exist_ok=True, parents=True)
