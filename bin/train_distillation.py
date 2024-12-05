@@ -279,9 +279,9 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                         pred_real_timesteps = torch.cat([dmd_timestep[:, None], torch.zeros_like(dmd_timestep[:, None])], dim=-1)
                         pred_real = sampler.guide(noisy_x, observation_mask, None, sampler.scale, timesteps=pred_real_timesteps)
                         pred_fake = fake_model.fast_denoise(noisy_x, dmd_timestep, features=None)
-                        # weighting_factor = (dmd_x[observation_mask == 0] - pred_real[observation_mask == 0]).view(batch_size, -1).abs().mean(dim=1) + 1e-9
-                        # weighting_factor = weighting_factor.view(-1, 1, 1).expand_as(dmd_x)
-                        # grad = (pred_fake - pred_real) / weighting_factor
+                        weighting_factor = (dmd_x[observation_mask == 0] - pred_real[observation_mask == 0]).view(batch_size, -1).abs().mean(dim=1) + 1e-9
+                        weighting_factor = weighting_factor.view(-1, 1, 1).expand_as(dmd_x)
+                        grad = (pred_fake - pred_real) / weighting_factor
                         grad = (pred_fake - pred_real)
                         target = dmd_x - grad
 
