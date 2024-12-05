@@ -284,20 +284,25 @@ class DDIMGuidance(Guidance):
 
     @torch.no_grad()
     def _reverse_ddim(
-        self, observation, observation_mask, features, base_scale
+        self, observation, observation_mask, features, base_scale, timesteps=None
     ):
         device = observation.device
         batch_size = observation.shape[0]
-        timesteps = self._get_timesteps()
-        timesteps_prev = [-1] + timesteps[:-1]
+        if timesteps is None:
+            timesteps = self._get_timesteps()
+            timesteps_list = []
+            for i in reversed(timesteps):
+                t = torch.full((batch_size,), i, device=device, dtype=torch.long)
+                timesteps_list.append(t)
+            timesteps = torch.stack(timesteps_list, dim=1)
 
+        timesteps_prev = torch.cat([timesteps[:, 1:], torch.full((batch_size,), -1, device=device, dtype=torch.long)[:, None]], dim=1)
+        num_timesteps = timesteps.shape[1]
         seq = torch.randn_like(observation)
 
-        for i, j in zip(reversed(timesteps), reversed(timesteps_prev)):
-            t = torch.full((batch_size,), i, device=device, dtype=torch.long)
-            t_prev = torch.full(
-                (batch_size,), j, device=device, dtype=torch.long
-            )
+        for i in range(num_timesteps):
+            t = timesteps[:, i]
+            t_prev = timesteps_prev[:, i]
             noise = self.model.backbone(seq, t, features)
             scale = self.scale_func(seq, t, base_scale=base_scale)
             noise = noise - scale * self.score_func(
@@ -310,7 +315,7 @@ class DDIMGuidance(Guidance):
             seq = self.model.p_sample_genddim(
                 seq,
                 t,
-                t_index=i,
+                t_index= 0 if torch.any(t_prev == -1) else 1,
                 t_prev=t_prev,
                 eta=self.eta,
                 features=features,
@@ -319,7 +324,7 @@ class DDIMGuidance(Guidance):
 
         return seq
 
-    def guide(self, observation, observation_mask, features, base_scale):
+    def guide(self, observation, observation_mask, features, base_scale, timesteps=None):
         return self._reverse_ddim(
-            observation, observation_mask, features, base_scale
+            observation, observation_mask, features, base_scale, timesteps=timesteps
         )
