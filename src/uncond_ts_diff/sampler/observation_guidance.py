@@ -284,7 +284,7 @@ class DDIMGuidance(Guidance):
 
     @torch.no_grad()
     def _reverse_ddim(
-        self, observation, observation_mask, features, base_scale, timesteps=None
+        self, observation, observation_mask, features, base_scale, timesteps=None, no_random_noise=False
     ):
         device = observation.device
         batch_size = observation.shape[0]
@@ -298,7 +298,10 @@ class DDIMGuidance(Guidance):
 
         timesteps_prev = torch.cat([timesteps[:, 1:], torch.full((batch_size,), -1, device=device, dtype=torch.long)[:, None]], dim=1)
         num_timesteps = timesteps.shape[1]
-        seq = torch.randn_like(observation)
+        if not no_random_noise:
+            seq = torch.randn_like(observation)
+        else:
+            seq = observation
 
         for i in range(num_timesteps):
             t = timesteps[:, i]
@@ -324,7 +327,7 @@ class DDIMGuidance(Guidance):
 
         return seq
 
-    def guide(self, observation, observation_mask, features, base_scale, timesteps=None):
+    def guide(self, observation, observation_mask, features, base_scale, timesteps=None, no_random_noise=False):
         return self._reverse_ddim(
-            observation, observation_mask, features, base_scale, timesteps=timesteps
+            observation, observation_mask, features, base_scale, timesteps=timesteps, no_random_noise=no_random_noise
         )

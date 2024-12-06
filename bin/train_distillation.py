@@ -169,9 +169,9 @@ def evaluate_one_step_generator(
 
 def main(config: dict, log_dir: str, dataset_dir: str):
     # set hyperparameter for distillation
-    num_steps = 180 # by micro batch, real batch size is 18 * 64
+    num_steps = 60 # by micro batch, real batch size is 18 * 64. 60 for pre-computed dataset 
     gradient_clip_val = 0.5
-    lr = 1.0e-3
+    lr = 1.0e-4
     batch_size = 64
     masking_size = 24
     missing_data_kwargs = {
@@ -180,7 +180,7 @@ def main(config: dict, log_dir: str, dataset_dir: str):
     }
     sampler_params = config["sampler_params"]
     sampling_batch_size = 64 * batch_size
-    is_dmd_loss = True
+    is_dmd_loss = False
     reg_loss_lambda = 1.0
 
     # Read global parameters
@@ -206,8 +206,18 @@ def main(config: dict, log_dir: str, dataset_dir: str):
         )
 
     optimizer_one_step = torch.optim.Adam(one_step_model.parameters(), lr=lr)
+    lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer_one_step, start_factor=0.01, total_iters=100)
+    one_step_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer_one_step, "min", patience=100, factor=0.5
+        )
+    one_step_scheduler = torch.optim.lr_scheduler.ChainedScheduler(schedulers=[lr_scheduler])
     if is_dmd_loss:
         optimizer_fake = torch.optim.Adam(fake_model.parameters(), lr=lr)
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer_fake, start_factor=0.01, total_iters=100)
+        fake_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer_fake, "min", patience=100, factor=0.5
+        )
+        fake_scheduler = torch.optim.lr_scheduler.ChainedScheduler(schedulers=[lr_scheduler])
     with trange(num_steps) as pbar:
         for step in pbar:
             # dataset file is not given, generate data on fly
@@ -233,19 +243,19 @@ def main(config: dict, log_dir: str, dataset_dir: str):
 
                     # making prediction data
                     masked_data[observation_mask == 0] = torch.randn_like(masked_data[observation_mask == 0])
-                    samples = sampler.guide(masked_data, observation_mask, None, sampler.scale)
+                    samples = sampler.guide(masked_data, observation_mask, None, sampler.scale, no_random_noise=True)
 
                 masked_datas = masked_data.view(-1, batch_size, masked_data.shape[1], masked_data.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
                 sampless = samples.view(-1, batch_size, samples.shape[1], samples.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
                 observation_masks = observation_mask.view(-1, batch_size, observation_mask.shape[1], observation_mask.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
             # dataset file is given, load data from file
             else:
-                masked_datas = torch.load(f"{dataset_dir}/x_{step}.pth")
-                sampless = torch.load(f"{dataset_dir}/z_{step}.pth")
+                masked_datas = torch.load(f"{dataset_dir}/z_{step}.pth").to(device)
+                sampless = torch.load(f"{dataset_dir}/x_{step}.pth").to(device)
 
                 # making observation mask
-                prior_mask = torch.ones((masked_datas.shape[0] * masked_datas.shape[1], masked_datas.shape[3]), device=device) # (sampling_batch_size, time_lags - 1)
-                observation_mask = torch.ones_like(masked_datas.view(-1, masked_datas.shape[2], masked_datas.shape[3])[:, : 0]) # (sampling_batch_size, seq_len)
+                prior_mask = torch.ones((masked_datas.shape[0] * masked_datas.shape[1], max(real_model.lags_seq)), device=device) # (sampling_batch_size, time_lags - 1)
+                observation_mask = torch.ones_like(masked_datas.view(-1, masked_datas.shape[2], masked_datas.shape[3])[:, :, 0]) # (sampling_batch_size, seq_len)
                 observation_mask[:,  -masking_size:] = 0.0
                 lagged_mask = lagged_sequence_values(
                     real_model.lags_seq,
@@ -258,14 +268,15 @@ def main(config: dict, log_dir: str, dataset_dir: str):
 
             loss_item_list = []
             dmd_loss_item_list = []
-            for masked_data, samples, observation_mask in zip(masked_datas, sampless, observation_masks):
+            for masked_data, samples, observation_mask in zip(tqdm(masked_datas, leave=False), sampless, observation_masks):
                 optimizer_one_step.zero_grad()
 
                 # calculating regression loss
                 t = torch.full((batch_size,), one_step_model.timesteps - 1, device=device, dtype=torch.long)
                 one_step_samples = one_step_model.fast_denoise(masked_data, t, features=None)
 
-                reg_loss = torch.nn.functional.mse_loss(one_step_samples[observation_mask == 0], samples[observation_mask == 0])
+                reg_loss = torch.nn.functional.mse_loss(one_step_samples, samples)
+                # reg_loss = torch.nn.functional.mse_loss(one_step_samples[observation_mask == 0], samples[observation_mask == 0])
                 loss = reg_loss_lambda * reg_loss
 
                 # calculating dmd loss
@@ -277,21 +288,22 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                     with torch.no_grad():
                         noisy_x = forward_diffusion_with_mask(real_model, dmd_x, dmd_timestep, observation_mask)
                         pred_real_timesteps = torch.cat([dmd_timestep[:, None], torch.zeros_like(dmd_timestep[:, None])], dim=-1)
-                        pred_real = sampler.guide(noisy_x, observation_mask, None, sampler.scale, timesteps=pred_real_timesteps)
+                        pred_real = sampler.guide(noisy_x, observation_mask, None, sampler.scale, timesteps=pred_real_timesteps, no_random_noise=True)
                         pred_fake = fake_model.fast_denoise(noisy_x, dmd_timestep, features=None)
                         weighting_factor = (dmd_x[observation_mask == 0] - pred_real[observation_mask == 0]).view(batch_size, -1).abs().mean(dim=1) + 1e-9
                         weighting_factor = weighting_factor.view(-1, 1, 1).expand_as(dmd_x)
                         grad = (pred_fake - pred_real) / weighting_factor
-                        grad = (pred_fake - pred_real)
                         target = dmd_x - grad
 
-                    dmd_loss = 0.5 * torch.nn.functional.mse_loss(dmd_x[observation_mask == 0], target[observation_mask == 0])
+                    dmd_loss = 0.5 * torch.nn.functional.mse_loss(dmd_x, target)
+                    # dmd_loss = 0.5 * torch.nn.functional.mse_loss(dmd_x[observation_mask == 0], target[observation_mask == 0])
                     loss += dmd_loss
                     dmd_loss_item_list.append(dmd_loss.item())
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(one_step_model.parameters(), gradient_clip_val)
                 optimizer_one_step.step()
+                one_step_scheduler.step()
 
                 # calculating denoising loss for fake model
                 if is_dmd_loss:
@@ -300,17 +312,22 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                     with torch.no_grad():
                         noisy_x = forward_diffusion_with_mask(fake_model, dmd_x, dmd_timestep, observation_mask)
                     pred_fake = fake_model.fast_denoise(noisy_x, dmd_timestep, features=None)
-                    denoising_loss = torch.nn.functional.mse_loss(pred_fake[observation_mask == 0], dmd_x[observation_mask == 0])
+                    denoising_loss = torch.nn.functional.mse_loss(pred_fake, dmd_x)
+                    # denoising_loss = torch.nn.functional.mse_loss(pred_fake[observation_mask == 0], dmd_x[observation_mask == 0])
                     optimizer_fake.zero_grad()
                     denoising_loss.backward()
                     torch.nn.utils.clip_grad_norm_(fake_model.parameters(), gradient_clip_val)
                     optimizer_fake.step()
+                    fake_scheduler.step()
                 loss_item_list.append(loss.item())
+                if is_dmd_loss:
+                    pbar.set_postfix({"loss": loss.item(), "dmd_loss": dmd_loss.item()})
+                else:
+                    pbar.set_postfix({"loss": loss.item()})
+
             if is_dmd_loss:
-                pbar.set_postfix({"loss": sum(loss_item_list) / len(loss_item_list), "dmd_loss": sum(dmd_loss_item_list) / len(dmd_loss_item_list)})
                 tqdm.write(f"Step {step}: loss {sum(loss_item_list) / len(loss_item_list)}, dmd_loss {sum(dmd_loss_item_list) / len(dmd_loss_item_list)}")
             else:
-                pbar.set_postfix({"loss": sum(loss_item_list) / len(loss_item_list)})
                 tqdm.write(f"Step {step}: loss {sum(loss_item_list) / len(loss_item_list)}")
 
 

@@ -152,6 +152,8 @@ def main(config: dict, log_dir: str):
     with trange(num_steps, disable=not is_main_process) as pbar:
         for step in pbar:
             with torch.no_grad():
+                if is_ddp:
+                    torch.distributed.barrier()
                 # generating data
                 gt_data = real_model.sample_n_grad(sampling_batch_size, return_lags=True)
                 # gt_data = torch.from_numpy(real_model.sample_n_grad(sampling_batch_size, return_lags=True))
@@ -172,29 +174,31 @@ def main(config: dict, log_dir: str):
 
                 # making prediction data
                 masked_data[observation_mask == 0] = torch.randn_like(masked_data[observation_mask == 0])
-                samples = sampler.guide(masked_data, observation_mask, None, sampler.scale)
+                samples = sampler.guide(masked_data, observation_mask, None, sampler.scale, no_random_noise=True)
 
-            masked_datas = masked_data.view(-1, batch_size, masked_data.shape[1], masked_data.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
-            sampless = samples.view(-1, batch_size, samples.shape[1], samples.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
-            if is_ddp:
-                masked_datas_gathered = [torch.zeros_like(masked_datas) for _ in range(ddp_world_size)]
-                sampless_gathered = [torch.zeros_like(sampless) for _ in range(ddp_world_size)]
-                all_gather(masked_datas_gathered, masked_datas)
-                all_gather(sampless_gathered, sampless)
-            
-            if is_main_process:
+                masked_datas = masked_data.view(-1, batch_size, masked_data.shape[1], masked_data.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
+                sampless = samples.view(-1, batch_size, samples.shape[1], samples.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
                 if is_ddp:
-                    masked_datas = torch.cat(masked_datas_gathered, dim=0)
-                    sampless = torch.cat(sampless_gathered, dim=0) 
-                z_list.append(masked_datas.detach().cpu())
-                x_list.append(sampless.detach().cpu())
+                    masked_datas_gathered = [torch.zeros_like(masked_datas) for _ in range(ddp_world_size)]
+                    sampless_gathered = [torch.zeros_like(sampless) for _ in range(ddp_world_size)]
+                    all_gather(masked_datas_gathered, masked_datas)
+                    all_gather(sampless_gathered, sampless)
+                
+                if is_main_process:
+                    if is_ddp:
+                        masked_datas = torch.cat(masked_datas_gathered, dim=0)
+                        sampless = torch.cat(sampless_gathered, dim=0) 
+                    z_list.append(masked_datas.detach().cpu())
+                    x_list.append(sampless.detach().cpu())
 
-            if is_main_process and (step + 1) % 5 == 0:
-                x = torch.cat(x_list, dim=0)
-                z = torch.cat(z_list, dim=0)
-                torch.save(x, f"data/x_{idx}.pth")
-                torch.save(z, f"data/z_{idx}.pth")
-                idx += 1
+                if is_main_process and (step + 1) % 5 == 0:
+                    x = torch.cat(x_list, dim=0)
+                    z = torch.cat(z_list, dim=0)
+                    torch.save(x, f"data/x_{idx}.pth")
+                    torch.save(z, f"data/z_{idx}.pth")
+                    idx += 1
+                    x_list = []
+                    z_list = []
 
 if __name__ == "__main__":
     # Setup Logger
