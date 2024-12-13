@@ -366,10 +366,11 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                         optimizer_fake.step()
                         fake_scheduler.step()
                 loss_item_list.append(loss.item())
-                if is_dmd_loss and is_reg_loss:
-                    pbar.set_postfix({"loss": loss.item(), "dmd_loss": dmd_loss.item(), "reg_loss": reg_loss.item()})
-                else:
-                    pbar.set_postfix({"loss": loss.item()})
+                postfix = {'loss': loss.item()}
+                if is_reg_loss: postfix['reg'] = reg_loss.item()
+                if is_fourier_loss: postfix['fourier'] = fourier_reg_loss.item()
+                if is_dmd_loss: postfix['dmd'] = dmd_loss.item()
+                pbar.set_postfix(postfix)
 
             if is_dmd_loss:
                 tqdm.write(f"Step {step}: loss {sum(loss_item_list) / len(loss_item_list)}, dmd_loss {sum(dmd_loss_item_list) / len(dmd_loss_item_list)}, reg_loss {sum(loss_item_list) / len(loss_item_list) - sum(dmd_loss_item_list) / len(dmd_loss_item_list)}")
