@@ -171,8 +171,8 @@ def evaluate_one_step_generator(
 def main(config: dict, log_dir: str, dataset_dir: str):
     # set hyperparameter for distillation
     num_steps = 60 # by micro batch, real batch size is 18 * 64. 60 for pre-computed dataset 
-    gradient_clip_val = 1
-    lr = 1e-3
+    gradient_clip_val = 0.1
+    lr = 1e-4
     batch_size = 64
     masking_size = 24
     missing_data_kwargs = {
@@ -182,7 +182,7 @@ def main(config: dict, log_dir: str, dataset_dir: str):
     sampler_params = config["sampler_params"]
     sampling_batch_size = 64 * batch_size
     is_dmd_loss = True
-    reg_loss_lambda = 1.0
+    reg_loss_lambda = 2
 
     # Read global parameters
     dataset_name = config["dataset"]
@@ -209,14 +209,14 @@ def main(config: dict, log_dir: str, dataset_dir: str):
     optimizer_one_step = torch.optim.Adam(one_step_model.parameters(), lr=lr)
     lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer_one_step, start_factor=0.01, total_iters=500)
     one_step_scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer_one_step, 50, gamma=0.99
+            optimizer_one_step, 200, gamma=0.99
         )
     one_step_scheduler = torch.optim.lr_scheduler.ChainedScheduler(schedulers=[lr_scheduler, one_step_scheduler])
     if is_dmd_loss:
         optimizer_fake = torch.optim.Adam(fake_model.parameters(), lr=lr)
         lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer_fake, start_factor=0.01, total_iters=500)
         fake_scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer_fake, 50, gamma=0.99
+            optimizer_fake, 200, gamma=0.99
         )
         fake_scheduler = torch.optim.lr_scheduler.ChainedScheduler(schedulers=[lr_scheduler, fake_scheduler])
     
