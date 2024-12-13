@@ -181,7 +181,7 @@ def main(config: dict, log_dir: str, dataset_dir: str):
     }
     sampler_params = config["sampler_params"]
     sampling_batch_size = 64 * batch_size
-    is_reg_loss = False
+    is_reg_loss = True
     is_dmd_loss = True
     reg_loss_lambda = 1.0
 
@@ -298,10 +298,11 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                         # pred_real = sampler.guide_fast(noisy_x, observation_mask, dmd_timestep, None, base_scale=sampler.scale)
                         # pred_real = sampler.guided_noise(noisy_x, observation_mask, dmd_timestep, None, base_scale=sampler.scale)
                         pred_real = real_model.backbone(noisy_x, dmd_timestep, None)
+                        denoise_real = real_model.fast_denoise(noisy_x, t, features=None)
                         
                         # pred_fake = fake_model.fast_denoise(noisy_x, dmd_timestep, features=None)
                         pred_fake = fake_model.backbone(noisy_x, dmd_timestep, None)
-                        weighting_factor = (dmd_x[observation_mask == 0] - pred_real[observation_mask == 0]).view(batch_size, -1).abs().mean(dim=1) + 1e-9
+                        weighting_factor = (dmd_x[observation_mask == 0] - denoise_real[observation_mask == 0]).view(batch_size, -1).abs().mean(dim=1) + 1e-9
                         weighting_factor = weighting_factor.view(-1, 1, 1).expand_as(dmd_x)
                         # grad = (pred_fake - pred_real) / weighting_factor # original
                         grad = (pred_real - pred_fake) / weighting_factor # reversed
