@@ -32,6 +32,28 @@ import uncond_ts_diff.configs as diffusion_configs
 
 guidance_map = {"ddpm": DDPMGuidance, "ddim": DDIMGuidance}
 
+def fourier_loss(predicted, target):
+    """
+    Computes the loss between the predicted and target sequences in the frequency domain.
+
+    Args:
+        predicted (torch.Tensor): Predicted time series of shape (batch_size, seq_len, ...).
+        target (torch.Tensor): Ground truth time series of shape (batch_size, seq_len, ...).
+
+    Returns:
+        torch.Tensor: Fourier-based loss value.
+    """
+    # Compute the Fourier transform of both sequences
+    pred_fft = torch.fft.fft(predicted, dim=1)
+    target_fft = torch.fft.fft(target, dim=1)
+
+    # Compute the magnitude spectrum
+    pred_magnitude = torch.abs(pred_fft)
+    target_magnitude = torch.abs(target_fft)
+
+    # Compute MSE on the magnitude spectrum
+    return torch.nn.functional.mse_loss(pred_magnitude, target_magnitude)
+
 @torch.no_grad()
 def forward_diffusion_with_mask(model: TSDiff, x_start, t, mask, noise=None):
     device = next(model.backbone.parameters()).device
@@ -170,9 +192,9 @@ def evaluate_one_step_generator(
 
 def main(config: dict, log_dir: str, dataset_dir: str):
     # set hyperparameter for distillation
-    num_steps = 60 # by micro batch, real batch size is 18 * 64. 60 for pre-computed dataset 
-    gradient_clip_val = 1
-    lr = 1e-3
+    num_steps = 12 # by micro batch, real batch size is 18 * 64. 60 for pre-computed dataset 
+    gradient_clip_val = 0.1
+    lr = 1e-4
     batch_size = 64
     masking_size = 24
     missing_data_kwargs = {
@@ -182,8 +204,10 @@ def main(config: dict, log_dir: str, dataset_dir: str):
     sampler_params = config["sampler_params"]
     sampling_batch_size = 64 * batch_size
     is_reg_loss = True
+    is_fourier_loss = True
     is_dmd_loss = True
-    reg_loss_lambda = 1.0
+    reg_loss_lambda = 2.0
+    fourier_loss_lambda = 2.0
 
     # Read global parameters
     dataset_name = config["dataset"]
@@ -284,6 +308,13 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                 if is_reg_loss:
                     reg_loss = torch.nn.functional.mse_loss(one_step_samples[observation_mask == 0], samples[observation_mask == 0])
                     loss += reg_loss_lambda * reg_loss
+                
+                if is_fourier_loss:
+                    fourier_reg_loss = fourier_loss(
+                        one_step_samples[observation_mask == 0],
+                        samples[observation_mask == 0]
+                    )
+                    loss += fourier_loss_lambda * fourier_reg_loss
 
                 # calculating dmd loss
                 if is_dmd_loss:
@@ -298,11 +329,12 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                         # pred_real = sampler.guide_fast(noisy_x, observation_mask, dmd_timestep, None, base_scale=sampler.scale)
                         # pred_real = sampler.guided_noise(noisy_x, observation_mask, dmd_timestep, None, base_scale=sampler.scale)
                         pred_real = real_model.backbone(noisy_x, dmd_timestep, None)
-                        denoise_real = real_model.fast_denoise(noisy_x, t, features=None)
+                        # denoise_real = real_model.fast_denoise(noisy_x, t, features=None)
                         
                         # pred_fake = fake_model.fast_denoise(noisy_x, dmd_timestep, features=None)
                         pred_fake = fake_model.backbone(noisy_x, dmd_timestep, None)
-                        weighting_factor = (dmd_x[observation_mask == 0] - denoise_real[observation_mask == 0]).view(batch_size, -1).abs().mean(dim=1) + 1e-9
+                        weighting_factor = (dmd_x[observation_mask == 0] - pred_real[observation_mask == 0]).view(batch_size, -1).abs().mean(dim=1) + 1e-9
+                        # weighting_factor = (dmd_x[observation_mask == 0] - denoise_real[observation_mask == 0]).view(batch_size, -1).abs().mean(dim=1) + 1e-9
                         weighting_factor = weighting_factor.view(-1, 1, 1).expand_as(dmd_x)
                         # grad = (pred_fake - pred_real) / weighting_factor # original
                         grad = (pred_real - pred_fake) / weighting_factor # reversed
@@ -320,18 +352,19 @@ def main(config: dict, log_dir: str, dataset_dir: str):
 
                 # calculating denoising loss for fake model
                 if is_dmd_loss:
-                    dmd_timestep = torch.randint(0, fake_model.timesteps, (batch_size,), device=device)
-                    dmd_x = dmd_x.detach()
-                    with torch.no_grad():
-                        noisy_x = forward_diffusion_with_mask(fake_model, dmd_x, dmd_timestep, observation_mask)
-                    pred_fake = fake_model.fast_denoise(noisy_x, dmd_timestep, features=None)
-                    denoising_loss = torch.nn.functional.mse_loss(pred_fake, dmd_x)
-                    # denoising_loss = torch.nn.functional.mse_loss(pred_fake[observation_mask == 0], dmd_x[observation_mask == 0])
-                    optimizer_fake.zero_grad()
-                    denoising_loss.backward()
-                    torch.nn.utils.clip_grad_norm_(fake_model.parameters(), gradient_clip_val)
-                    optimizer_fake.step()
-                    fake_scheduler.step()
+                    for _ in range(10):
+                        dmd_timestep = torch.randint(0, fake_model.timesteps, (batch_size,), device=device)
+                        dmd_x = dmd_x.detach()
+                        with torch.no_grad():
+                            noisy_x = forward_diffusion_with_mask(fake_model, dmd_x, dmd_timestep, observation_mask)
+                        pred_fake = fake_model.fast_denoise(noisy_x, dmd_timestep, features=None)
+                        denoising_loss = torch.nn.functional.mse_loss(pred_fake, dmd_x)
+                        # denoising_loss = torch.nn.functional.mse_loss(pred_fake[observation_mask == 0], dmd_x[observation_mask == 0])
+                        optimizer_fake.zero_grad()
+                        denoising_loss.backward()
+                        torch.nn.utils.clip_grad_norm_(fake_model.parameters(), gradient_clip_val)
+                        optimizer_fake.step()
+                        fake_scheduler.step()
                 loss_item_list.append(loss.item())
                 if is_dmd_loss and is_reg_loss:
                     pbar.set_postfix({"loss": loss.item(), "dmd_loss": dmd_loss.item(), "reg_loss": reg_loss.item()})
