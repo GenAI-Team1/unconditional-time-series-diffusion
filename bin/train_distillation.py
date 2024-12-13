@@ -181,6 +181,7 @@ def main(config: dict, log_dir: str, dataset_dir: str):
     }
     sampler_params = config["sampler_params"]
     sampling_batch_size = 64 * batch_size
+    is_reg_loss = False
     is_dmd_loss = True
     reg_loss_lambda = 1.0
 
@@ -277,10 +278,12 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                 # calculating regression loss
                 t = torch.full((batch_size,), one_step_model.timesteps - 1, device=device, dtype=torch.long)
                 one_step_samples = one_step_model.fast_denoise(masked_data, t, features=None)
+                loss = 0
 
                 # reg_loss = torch.nn.functional.mse_loss(one_step_samples, samples)
-                reg_loss = torch.nn.functional.mse_loss(one_step_samples[observation_mask == 0], samples[observation_mask == 0])
-                loss = reg_loss_lambda * reg_loss
+                if is_reg_loss:
+                    reg_loss = torch.nn.functional.mse_loss(one_step_samples[observation_mask == 0], samples[observation_mask == 0])
+                    loss += reg_loss_lambda * reg_loss
 
                 # calculating dmd loss
                 if is_dmd_loss:
@@ -329,7 +332,7 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                     optimizer_fake.step()
                     fake_scheduler.step()
                 loss_item_list.append(loss.item())
-                if is_dmd_loss:
+                if is_dmd_loss and is_reg_loss:
                     pbar.set_postfix({"loss": loss.item(), "dmd_loss": dmd_loss.item(), "reg_loss": reg_loss.item()})
                 else:
                     pbar.set_postfix({"loss": loss.item()})
