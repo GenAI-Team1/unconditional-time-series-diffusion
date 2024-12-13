@@ -12,7 +12,6 @@ from gluonts.torch.util import lagged_sequence_values
 from gluonts.evaluation import make_evaluation_predictions, Evaluator
 from tqdm import tqdm, trange
 import os
-from torch.distributed import init_process_group, all_reduce, all_gather
 
 from uncond_ts_diff.utils import (
     create_transforms,
@@ -95,45 +94,20 @@ def main(config: dict, log_dir: str):
     sampler_params = config["sampler_params"]
     sampling_batch_size = 64 * batch_size
     
-    # set up DDP (distributed data parallel). torchrun sets this env variable
-    is_ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-
     # Load dataset and model
     logger.info("Loading model")
     real_model = load_model(config)
 
-    if is_ddp:
-        # use of DDP atm demands CUDA, we set the device appropriately according to rank
-        assert torch.cuda.is_available(), "for now i think we need CUDA for DDP"
-        
-        # initialize DDP
-        torch.distributed.init_process_group(backend='nccl')
-
-        # parameters for DDP
-        ddp_rank = int(os.environ['RANK'])
-        ddp_local_rank = int(os.environ['LOCAL_RANK'])
-        ddp_world_size = int(os.environ['WORLD_SIZE'])
-        device = f'cuda:{ddp_local_rank}'
-        real_model = real_model.to(device)
-        # real_model = torch.nn.parallel.DistributedDataParallel(real_model, device_ids=[ddp_local_rank])        
-        is_main_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-        seed_offset = 0 # each process gets the exact same seed
-        
-    else:
-        ddp_rank = 0
-        ddp_local_rank = 0
-        ddp_world_size = 1
-        is_main_process = True
-        seed_offset = 0
-
-       # attempt to autodetect the device
-        device = "cpu"
-        if torch.cuda.is_available():
-            device = "cuda"
-    
-    torch.manual_seed(42 + ddp_local_rank)
+    # attempt to autodetect the device
+    device = "cpu"
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(42 + ddp_local_rank)
+        device = "cuda"
+    
+    real_model = real_model.to(device)
+
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
  
     # Set up for guidance
     sampler = DDIMGuidance(
@@ -147,13 +121,10 @@ def main(config: dict, log_dir: str):
     x_list = []
     z_list = []
     idx = 0
-    if is_main_process:
-        print('start generating data')
-    with trange(num_steps, disable=not is_main_process) as pbar:
+    print('start generating data')
+    with trange(num_steps) as pbar:
         for step in pbar:
             with torch.no_grad():
-                if is_ddp:
-                    torch.distributed.barrier()
                 # generating data
                 gt_data = real_model.sample_n_grad(sampling_batch_size, return_lags=True)
                 # gt_data = torch.from_numpy(real_model.sample_n_grad(sampling_batch_size, return_lags=True))
@@ -178,20 +149,10 @@ def main(config: dict, log_dir: str):
 
                 masked_datas = masked_data.view(-1, batch_size, masked_data.shape[1], masked_data.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
                 sampless = samples.view(-1, batch_size, samples.shape[1], samples.shape[2]) # (sampling_batch_size // batch_size, batch_size, seq_len, time_lags)
-                if is_ddp:
-                    masked_datas_gathered = [torch.zeros_like(masked_datas) for _ in range(ddp_world_size)]
-                    sampless_gathered = [torch.zeros_like(sampless) for _ in range(ddp_world_size)]
-                    all_gather(masked_datas_gathered, masked_datas)
-                    all_gather(sampless_gathered, sampless)
-                
-                if is_main_process:
-                    if is_ddp:
-                        masked_datas = torch.cat(masked_datas_gathered, dim=0)
-                        sampless = torch.cat(sampless_gathered, dim=0) 
-                    z_list.append(masked_datas.detach().cpu())
-                    x_list.append(sampless.detach().cpu())
+                z_list.append(masked_datas.detach().cpu())
+                x_list.append(sampless.detach().cpu())
 
-                if is_main_process and (step + 1) % 5 == 0:
+                if (step + 1) % 5 == 0:
                     x = torch.cat(x_list, dim=0)
                     z = torch.cat(z_list, dim=0)
                     torch.save(x, f"data/x_{idx}.pth")
@@ -219,7 +180,7 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
 
     with open(args.config, "r") as fp:
-        config = yaml.safe_load(fp)
+        config = yaml.safe_load(fp) 
 
     # Update config from command line
     parser = add_config_to_argparser(config=config, parser=parser)
