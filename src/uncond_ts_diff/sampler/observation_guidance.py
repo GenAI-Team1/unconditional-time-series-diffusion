@@ -331,3 +331,39 @@ class DDIMGuidance(Guidance):
         return self._reverse_ddim(
             observation, observation_mask, features, base_scale, timesteps=timesteps, no_random_noise=no_random_noise
         )
+    
+    def guide_fast(self, observation, observation_mask, t, features, base_scale):
+        noise = self.model.backbone(observation, t, features)
+
+        sqrt_one_minus_alphas_cumprod_t = extract(
+            self.model.sqrt_one_minus_alphas_cumprod, t, observation.shape
+        )
+        sqrt_alphas_cumprod_t = extract(self.model.sqrt_alphas_cumprod, t, observation.shape)
+        
+        scale = sqrt_alphas_cumprod_t * base_scale
+        noise = noise - scale * self.score_func(
+            observation,
+            t,
+            observation=observation,
+            observation_mask=observation_mask,
+            features=features,
+        )
+        
+        return (
+            observation - sqrt_one_minus_alphas_cumprod_t * noise
+        ) / sqrt_alphas_cumprod_t
+    
+    def guided_noise(self, observation, observation_mask, t, features, base_scale):
+        noise = self.model.backbone(observation, t, features)
+        sqrt_alphas_cumprod_t = extract(self.model.sqrt_alphas_cumprod, t, observation.shape)
+        
+        scale = sqrt_alphas_cumprod_t * base_scale
+        noise = noise - scale * self.score_func(
+            observation,
+            t,
+            observation=observation,
+            observation_mask=observation_mask,
+            features=features,
+        )
+        
+        return noise

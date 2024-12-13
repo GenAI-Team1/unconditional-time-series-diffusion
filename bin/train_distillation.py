@@ -11,6 +11,7 @@ from gluonts.dataset.field_names import FieldName
 from gluonts.torch.util import lagged_sequence_values
 from gluonts.evaluation import make_evaluation_predictions, Evaluator
 from tqdm import tqdm, trange
+from copy import deepcopy
 
 from uncond_ts_diff.utils import (
     create_transforms,
@@ -170,8 +171,8 @@ def evaluate_one_step_generator(
 def main(config: dict, log_dir: str, dataset_dir: str):
     # set hyperparameter for distillation
     num_steps = 60 # by micro batch, real batch size is 18 * 64. 60 for pre-computed dataset 
-    gradient_clip_val = 0.5
-    lr = 1.0e-4
+    gradient_clip_val = 1
+    lr = 1e-3
     batch_size = 64
     masking_size = 24
     missing_data_kwargs = {
@@ -180,7 +181,7 @@ def main(config: dict, log_dir: str, dataset_dir: str):
     }
     sampler_params = config["sampler_params"]
     sampling_batch_size = 64 * batch_size
-    is_dmd_loss = False
+    is_dmd_loss = True
     reg_loss_lambda = 1.0
 
     # Read global parameters
@@ -206,18 +207,20 @@ def main(config: dict, log_dir: str, dataset_dir: str):
         )
 
     optimizer_one_step = torch.optim.Adam(one_step_model.parameters(), lr=lr)
-    lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer_one_step, start_factor=0.01, total_iters=100)
-    one_step_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer_one_step, "min", patience=100, factor=0.5
+    lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer_one_step, start_factor=0.01, total_iters=500)
+    one_step_scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer_one_step, 50, gamma=0.99
         )
-    one_step_scheduler = torch.optim.lr_scheduler.ChainedScheduler(schedulers=[lr_scheduler])
+    one_step_scheduler = torch.optim.lr_scheduler.ChainedScheduler(schedulers=[lr_scheduler, one_step_scheduler])
     if is_dmd_loss:
         optimizer_fake = torch.optim.Adam(fake_model.parameters(), lr=lr)
-        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer_fake, start_factor=0.01, total_iters=100)
-        fake_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer_fake, "min", patience=100, factor=0.5
+        lr_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer_fake, start_factor=0.01, total_iters=500)
+        fake_scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer_fake, 50, gamma=0.99
         )
-        fake_scheduler = torch.optim.lr_scheduler.ChainedScheduler(schedulers=[lr_scheduler])
+        fake_scheduler = torch.optim.lr_scheduler.ChainedScheduler(schedulers=[lr_scheduler, fake_scheduler])
+    
+    best_reg_loss = float("inf")
     with trange(num_steps) as pbar:
         for step in pbar:
             # dataset file is not given, generate data on fly
@@ -275,8 +278,8 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                 t = torch.full((batch_size,), one_step_model.timesteps - 1, device=device, dtype=torch.long)
                 one_step_samples = one_step_model.fast_denoise(masked_data, t, features=None)
 
-                reg_loss = torch.nn.functional.mse_loss(one_step_samples, samples)
-                # reg_loss = torch.nn.functional.mse_loss(one_step_samples[observation_mask == 0], samples[observation_mask == 0])
+                # reg_loss = torch.nn.functional.mse_loss(one_step_samples, samples)
+                reg_loss = torch.nn.functional.mse_loss(one_step_samples[observation_mask == 0], samples[observation_mask == 0])
                 loss = reg_loss_lambda * reg_loss
 
                 # calculating dmd loss
@@ -288,15 +291,21 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                     with torch.no_grad():
                         noisy_x = forward_diffusion_with_mask(real_model, dmd_x, dmd_timestep, observation_mask)
                         pred_real_timesteps = torch.cat([dmd_timestep[:, None], torch.zeros_like(dmd_timestep[:, None])], dim=-1)
-                        pred_real = sampler.guide(noisy_x, observation_mask, None, sampler.scale, timesteps=pred_real_timesteps, no_random_noise=True)
-                        pred_fake = fake_model.fast_denoise(noisy_x, dmd_timestep, features=None)
+                        # pred_real = sampler.guide(noisy_x, observation_mask, None, sampler.scale, timesteps=pred_real_timesteps, no_random_noise=True)
+                        # pred_real = sampler.guide_fast(noisy_x, observation_mask, dmd_timestep, None, base_scale=sampler.scale)
+                        # pred_real = sampler.guided_noise(noisy_x, observation_mask, dmd_timestep, None, base_scale=sampler.scale)
+                        pred_real = real_model.backbone(noisy_x, dmd_timestep, None)
+                        
+                        # pred_fake = fake_model.fast_denoise(noisy_x, dmd_timestep, features=None)
+                        pred_fake = fake_model.backbone(noisy_x, dmd_timestep, None)
                         weighting_factor = (dmd_x[observation_mask == 0] - pred_real[observation_mask == 0]).view(batch_size, -1).abs().mean(dim=1) + 1e-9
                         weighting_factor = weighting_factor.view(-1, 1, 1).expand_as(dmd_x)
-                        grad = (pred_fake - pred_real) / weighting_factor
+                        # grad = (pred_fake - pred_real) / weighting_factor # original
+                        grad = (pred_real - pred_fake) / weighting_factor # reversed
                         target = dmd_x - grad
 
-                    dmd_loss = 0.5 * torch.nn.functional.mse_loss(dmd_x, target)
-                    # dmd_loss = 0.5 * torch.nn.functional.mse_loss(dmd_x[observation_mask == 0], target[observation_mask == 0])
+                    # dmd_loss = 0.5 * torch.nn.functional.mse_loss(dmd_x, target)
+                    dmd_loss = 0.5 * torch.nn.functional.mse_loss(dmd_x[observation_mask == 0], target[observation_mask == 0])
                     loss += dmd_loss
                     dmd_loss_item_list.append(dmd_loss.item())
 
@@ -321,16 +330,22 @@ def main(config: dict, log_dir: str, dataset_dir: str):
                     fake_scheduler.step()
                 loss_item_list.append(loss.item())
                 if is_dmd_loss:
-                    pbar.set_postfix({"loss": loss.item(), "dmd_loss": dmd_loss.item()})
+                    pbar.set_postfix({"loss": loss.item(), "dmd_loss": dmd_loss.item(), "reg_loss": reg_loss.item()})
                 else:
                     pbar.set_postfix({"loss": loss.item()})
 
             if is_dmd_loss:
-                tqdm.write(f"Step {step}: loss {sum(loss_item_list) / len(loss_item_list)}, dmd_loss {sum(dmd_loss_item_list) / len(dmd_loss_item_list)}")
+                tqdm.write(f"Step {step}: loss {sum(loss_item_list) / len(loss_item_list)}, dmd_loss {sum(dmd_loss_item_list) / len(dmd_loss_item_list)}, reg_loss {sum(loss_item_list) / len(loss_item_list) - sum(dmd_loss_item_list) / len(dmd_loss_item_list)}")
+                reg_loss = sum(loss_item_list) / len(loss_item_list) - sum(dmd_loss_item_list) / len(dmd_loss_item_list)
             else:
                 tqdm.write(f"Step {step}: loss {sum(loss_item_list) / len(loss_item_list)}")
+                reg_loss = sum(loss_item_list) / len(loss_item_list)
 
+            if reg_loss < best_reg_loss:
+                best_reg_loss = reg_loss
+                # best_model = deepcopy(one_step_model.state_dict())
 
+    # one_step_model.load_state_dict(best_model)
     if True: # for evaluation code
         dataset = get_gts_dataset(dataset_name)
         assert dataset.metadata.freq == freq
