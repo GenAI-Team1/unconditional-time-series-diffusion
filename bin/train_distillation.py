@@ -44,8 +44,8 @@ def fourier_loss(predicted, target):
         torch.Tensor: Fourier-based loss value.
     """
     # Compute the Fourier transform of both sequences
-    pred_fft = torch.fft.fft(predicted, dim=1)
-    target_fft = torch.fft.fft(target, dim=1)
+    pred_fft = torch.fft.fft(predicted, dim=-1)
+    target_fft = torch.fft.fft(target, dim=-1)
 
     # Compute the magnitude spectrum
     pred_magnitude = torch.abs(pred_fft)
@@ -192,9 +192,10 @@ def evaluate_one_step_generator(
 
 def main(config: dict, log_dir: str, dataset_dir: str):
     # set hyperparameter for distillation
-    num_steps = 12 # by micro batch, real batch size is 18 * 64. 60 for pre-computed dataset 
+    num_steps = 24 # by micro batch, real batch size is 18 * 64. 60 for pre-computed dataset 
     gradient_clip_val = 0.1
     lr = 1e-4
+    fake_step = 1
     batch_size = 64
     masking_size = 24
     missing_data_kwargs = {
@@ -206,8 +207,8 @@ def main(config: dict, log_dir: str, dataset_dir: str):
     is_reg_loss = True
     is_fourier_loss = True
     is_dmd_loss = True
-    reg_loss_lambda = 2.0
-    fourier_loss_lambda = 2.0
+    reg_loss_lambda = 4.0
+    fourier_loss_lambda = 5e-4
 
     # Read global parameters
     dataset_name = config["dataset"]
@@ -352,7 +353,7 @@ def main(config: dict, log_dir: str, dataset_dir: str):
 
                 # calculating denoising loss for fake model
                 if is_dmd_loss:
-                    for _ in range(10):
+                    for _ in range(fake_step):
                         dmd_timestep = torch.randint(0, fake_model.timesteps, (batch_size,), device=device)
                         dmd_x = dmd_x.detach()
                         with torch.no_grad():
